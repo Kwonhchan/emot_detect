@@ -4,3 +4,5 @@
 /runs
 /best_model_checkpoint.pth
 /model
+/bm
+/.vscode

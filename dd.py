@@ -1,15 +1,16 @@
 import numpy as np
 import pandas as pd
 import torch
-import torchaudio
+import torch.nn as nn
+import torch.nn.functional as F
 import librosa
 import os
 from torch.utils.data import Dataset, DataLoader
-import torch.nn as nn
 from transformers import Wav2Vec2Model
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import StepLR
 
 SAMPLING_RATE = 16000
 TARGET_LENGTH = 16000
@@ -47,24 +48,23 @@ class EmotionRecognitionModel(nn.Module):
     def __init__(self, num_labels):
         super(EmotionRecognitionModel, self).__init__()
         self.wav2vec2 = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-large-960h")
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(self.wav2vec2.config.hidden_size, num_labels)
+        self.dropout1 = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(self.wav2vec2.config.hidden_size, 512)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, num_labels)
 
     def forward(self, input_values):
         outputs = self.wav2vec2(input_values=input_values).last_hidden_state
         output = outputs[:, 0, :]
-        output = self.dropout(output)
-        logits = self.classifier(output)
+        output = self.dropout1(F.relu(self.fc1(output)))
+        output = self.dropout2(F.relu(self.fc2(output)))
+        logits = self.fc3(output)
         return logits
 
-# CUDA 설정
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if torch.cuda.is_available():
-    print("CUDA is available. Using CUDA.")
-else:
-    print("CUDA is not available. Using CPU.")
+print(f"Using {'CUDA' if device.type == 'cuda' else 'CPU'} for computation.")
 
-# 데이터셋 준비
 df = pd.read_csv(r'C:\Users\kwonh\Desktop\wvp\data\train.csv')
 train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
 
@@ -74,36 +74,36 @@ val_dataset = AudioDataset(val_df, r'C:\Users\kwonh\Desktop\wvp\data')
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
 
-# 모델, 손실 함수, 옵티마이저 설정
 model = EmotionRecognitionModel(num_labels=6).to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
 
-# TensorBoard 설정
 writer = SummaryWriter('runs/emotion_recognition_experiment')
 
-# 학습 및 검증
-best_val_loss = float('inf')
-epochs = 30
-for epoch in range(epochs):
+def train_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
-    train_loss = 0
-    for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} Training"):
+    total_loss = 0
+    progress_bar = tqdm(train_loader, desc='Training', leave=True)
+    for inputs, labels in progress_bar:
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
         outputs = model(inputs.squeeze(1))
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        train_loss += loss.item()
+        total_loss += loss.item()
+        progress_bar.set_postfix({'Training Loss': f'{loss.item():.4f}'})
+    return total_loss / len(train_loader)
 
-    # 검증
+def validate_model(model, val_loader, criterion, device):
     model.eval()
     val_loss = 0
     correct = 0
     total = 0
+    progress_bar = tqdm(val_loader, desc='Validation', leave=True)
     with torch.no_grad():
-        for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} Validation"):
+        for inputs, labels in progress_bar:
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs.squeeze(1))
             loss = criterion(outputs, labels)
@@ -111,24 +111,27 @@ for epoch in range(epochs):
             _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-
-    avg_train_loss = train_loss / len(train_loader)
-    avg_val_loss = val_loss / len(val_loader)
+            progress_bar.set_postfix({'Validation Loss': f'{loss.item():.4f}'})
     accuracy = 100 * correct / total
-    print(f"Epoch {epoch + 1}: Training Loss = {avg_train_loss:.4f}, Validation Loss = {avg_val_loss:.4f}, Accuracy = {accuracy:.2f}%")
+    return val_loss / len(val_loader), accuracy
 
-    # TensorBoard에 기록
-    writer.add_scalar('Loss/train', avg_train_loss, epoch)
-    writer.add_scalar('Loss/val', avg_val_loss, epoch)
+best_val_loss = float('inf')
+for epoch in range(30):
+    train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+    val_loss, accuracy = validate_model(model, val_loader, criterion, device)
+    scheduler.step()
+    writer.add_scalar('Loss/train', train_loss, epoch)
+    writer.add_scalar('Loss/val', val_loss, epoch)
     writer.add_scalar('Accuracy/val', accuracy, epoch)
-
-    # 최고 모델 저장
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        torch.save(model.state_dict(), 'bm/best_model.pth')
-        print(f"New best model saved with Validation Loss: {best_val_loss:.4f}")
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), 'best_model.pth')
+        print(f"\nEpoch {epoch+1}: New best model saved with val loss {best_val_loss:.4f}")
+    else:
+        print(f"\nEpoch {epoch+1}: Train loss {train_loss:.4f}, Val loss {val_loss:.4f}, Accuracy {accuracy:.2f}%")
+        if epoch > 4 and val_loss >= best_val_loss:  # Simple early stopping
+            print("Early stopping triggered.")
+            break
 
 writer.close()
-print(f"Training completed. Best Validation Loss: {best_val_loss:.4f}")
-
-
+print("Training completed.")

@@ -1,3 +1,7 @@
+import torch
+
+
+
 def predict_emotion(audio_path, model, device):
     model.eval()  # 모델을 평가 모드로 설정
     audio = load_raw_audio(audio_path, TARGET_LENGTH)
